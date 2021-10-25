@@ -216,6 +216,7 @@ func (b *VolumeSnapshotter) describeVolume(volumeID string) (*ec2.Volume, error)
 
 	res, err := b.ec2.DescribeVolumes(req)
 	if err != nil {
+		// TODO retry after RequestLimitExceeded
 		return nil, errors.WithStack(err)
 	}
 	if count := len(res.Volumes); count != 1 {
@@ -278,6 +279,7 @@ func (b *VolumeSnapshotter) CreateSnapshot(volumeID, volumeAZ string, tags map[s
 		},
 	})
 	if err != nil {
+		// TODO retry after RequestLimitExceeded
 		return "", errors.WithStack(err)
 	}
 	var latest *ec2.Snapshot
@@ -310,13 +312,24 @@ func (b *VolumeSnapshotter) CreateSnapshot(volumeID, volumeAZ string, tags map[s
 	}
 
 	sourceRegion := b.ec2.Config.Region
-	copyResult, err := b.altRegionEc2.CopySnapshot(&ec2.CopySnapshotInput{
-		SourceRegion:      sourceRegion,
-		SourceSnapshotId:  originalSnapshot.SnapshotId,
-		TagSpecifications: tagSpecs,
-	})
-	if err != nil {
-		return "", errors.Wrapf(err, "Failed to copy %s in %s to %s", *originalSnapshot.SnapshotId, *sourceRegion, *b.altRegionEc2.Config.Region)
+	var copyResult *ec2.CopySnapshotOutput
+	for {
+		copyResult, err = b.altRegionEc2.CopySnapshot(&ec2.CopySnapshotInput{
+			SourceRegion:      sourceRegion,
+			SourceSnapshotId:  originalSnapshot.SnapshotId,
+			TagSpecifications: tagSpecs,
+		})
+		if err != nil {
+			// TODO better to use standard system: https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk/retries-timeouts/
+			message := err.Error()
+			if strings.Contains(message, "ResourceLimitExceeded") || strings.Contains(message, "RequestLimitExceeded") {
+				log.Warningf("Will retry copy of %s in %s to %s in a minute: %v", *originalSnapshot.SnapshotId, *sourceRegion, *b.altRegionEc2.Config.Region, err)
+				time.Sleep(time.Minute)
+				continue
+			}
+			return "", errors.Wrapf(err, "Failed to copy %s in %s to %s", *originalSnapshot.SnapshotId, *sourceRegion, *b.altRegionEc2.Config.Region)
+		}
+		break
 	}
 
 	copiedSnapshot, err := getOneSnapshot(b.altRegionEc2, *copyResult.SnapshotId)
@@ -344,10 +357,15 @@ func waitForSnapshotToComplete(regionalEC2 *ec2.EC2, snapshot *ec2.Snapshot, log
 		log.Infof(messageFormat, *snapshot.SnapshotId, *snapshot.Progress)
 		time.Sleep(time.Duration(delaySec * float64(time.Second)))
 		var err error
-		snapshot, err = getOneSnapshot(regionalEC2, *snapshot.SnapshotId)
+		snapshot2, err := getOneSnapshot(regionalEC2, *snapshot.SnapshotId)
 		if err != nil {
+			if strings.Contains(err.Error(), "RequestLimitExceeded") {
+				log.Warningf("Will retry snapshot completion check: %v", err)
+				continue
+			}
 			return nil, errors.WithStack(err)
 		}
+		snapshot = snapshot2
 	}
 	log.Infof("Snapshot complete in %.1fs", time.Since(start).Seconds())
 	return snapshot, nil
