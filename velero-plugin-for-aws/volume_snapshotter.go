@@ -70,6 +70,9 @@ func getSession(options session.Options) (*session.Session, error) {
 
 func prepareSession(region, credentialProfile string) (*session.Session, error) {
 	awsConfig := aws.NewConfig().WithRegion(region)
+	/* TODO make variant of client.DefaultRetryer which retries longer for RequestLimitExceeded or ResourceLimitExceeded rather than ad-hoc idioms below:
+	awsConfig = request.WithRetryer(awsConfig, …)
+	*/
 	sessionOptions := session.Options{Config: *awsConfig, Profile: credentialProfile}
 	sess, err := getSession(sessionOptions)
 	if err != nil {
@@ -214,9 +217,14 @@ func (b *VolumeSnapshotter) describeVolume(volumeID string) (*ec2.Volume, error)
 		VolumeIds: []*string{&volumeID},
 	}
 
+DESCRIBE_VOLUMES:
 	res, err := b.ec2.DescribeVolumes(req)
 	if err != nil {
-		// TODO retry after RequestLimitExceeded
+		if strings.Contains(err.Error(), "RequestLimitExceeded") {
+			b.log.Warningf("Will retry DescribeVolumes in a minute: %v", err)
+			time.Sleep(time.Minute)
+			goto DESCRIBE_VOLUMES
+		}
 		return nil, errors.WithStack(err)
 	}
 	if count := len(res.Volumes); count != 1 {
@@ -256,6 +264,7 @@ func (b *VolumeSnapshotter) CreateSnapshot(volumeID, volumeAZ string, tags map[s
 		TagSpecifications: tagSpecs,
 	})
 	if err != nil {
+		// TODO this can throw InternalError; unclear what that means
 		return "", errors.WithStack(err)
 	}
 
@@ -270,6 +279,7 @@ func (b *VolumeSnapshotter) CreateSnapshot(volumeID, volumeAZ string, tags map[s
 
 	// Display size of snapshot relative to the last snapshot of this volume.
 	filterName := "volume-id"
+DESCRIBE_SNAPSHOTS:
 	findPreviousSnapshot, err := b.ec2.DescribeSnapshots(&ec2.DescribeSnapshotsInput{
 		Filters: []*ec2.Filter{
 			{
@@ -279,7 +289,11 @@ func (b *VolumeSnapshotter) CreateSnapshot(volumeID, volumeAZ string, tags map[s
 		},
 	})
 	if err != nil {
-		// TODO retry after RequestLimitExceeded
+		if strings.Contains(err.Error(), "RequestLimitExceeded") {
+			log.Warningf("Will retry DescribeSnapshots in a minute: %v", err)
+			time.Sleep(time.Minute)
+			goto DESCRIBE_SNAPSHOTS
+		}
 		return "", errors.WithStack(err)
 	}
 	var latest *ec2.Snapshot
@@ -312,24 +326,20 @@ func (b *VolumeSnapshotter) CreateSnapshot(volumeID, volumeAZ string, tags map[s
 	}
 
 	sourceRegion := b.ec2.Config.Region
-	var copyResult *ec2.CopySnapshotOutput
-	for {
-		copyResult, err = b.altRegionEc2.CopySnapshot(&ec2.CopySnapshotInput{
-			SourceRegion:      sourceRegion,
-			SourceSnapshotId:  originalSnapshot.SnapshotId,
-			TagSpecifications: tagSpecs,
-		})
-		if err != nil {
-			// TODO better to use standard system: https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk/retries-timeouts/
-			message := err.Error()
-			if strings.Contains(message, "ResourceLimitExceeded") || strings.Contains(message, "RequestLimitExceeded") {
-				log.Warningf("Will retry copy of %s in %s to %s in a minute: %v", *originalSnapshot.SnapshotId, *sourceRegion, *b.altRegionEc2.Config.Region, err)
-				time.Sleep(time.Minute)
-				continue
-			}
-			return "", errors.Wrapf(err, "Failed to copy %s in %s to %s", *originalSnapshot.SnapshotId, *sourceRegion, *b.altRegionEc2.Config.Region)
+COPY_SNAPSHOT:
+	copyResult, err := b.altRegionEc2.CopySnapshot(&ec2.CopySnapshotInput{
+		SourceRegion:      sourceRegion,
+		SourceSnapshotId:  originalSnapshot.SnapshotId,
+		TagSpecifications: tagSpecs,
+	})
+	if err != nil {
+		message := err.Error()
+		if strings.Contains(message, "ResourceLimitExceeded") || strings.Contains(message, "RequestLimitExceeded") {
+			log.Warningf("Will retry CopySnapshot in a minute: %v", err)
+			time.Sleep(time.Minute)
+			goto COPY_SNAPSHOT
 		}
-		break
+		return "", errors.Wrapf(err, "Failed to copy %s in %s to %s", *originalSnapshot.SnapshotId, *sourceRegion, *b.altRegionEc2.Config.Region)
 	}
 
 	copiedSnapshot, err := getOneSnapshot(b.altRegionEc2, *copyResult.SnapshotId)
