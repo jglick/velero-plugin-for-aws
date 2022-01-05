@@ -171,6 +171,7 @@ func (b *VolumeSnapshotter) CreateVolumeFromSnapshot(compositeSnapshotID, volume
 
 	res, err := b.ec2.CreateVolume(req)
 	if err != nil {
+		// TODO wait if we receive: rpc error: code = Unknown desc = IncorrectState: Snapshot is in invalid state - pending
 		return "", errors.WithStack(err)
 	}
 
